@@ -87,9 +87,9 @@ app.post('/api/leads/collegedunia', async (req, res) => {
                     name: value.student_name,
                     mobile: cleanMobile,
                     email: value.student_email || "no-email@foc.com",
-                    detail1: value.interested_course || "General Inquiry", 
-                    detail2: value.student_city || "Not Specified",     
-                    detail3: value.interested_city || "Not Specified",  
+                    course: value.interested_course || "General Inquiry", 
+                    student_city: value.student_city || "Not Specified",     
+                    interested_city: value.interested_city || "Not Specified",  
                     source: "COLLEGEDUNIA",                    
                     medium: value.medium                       
                 };
