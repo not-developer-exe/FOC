@@ -10,7 +10,7 @@ app.use(helmet());
 app.use(cors({
     origin: ['https://futureoncampus.com', 'https://www.futureoncampus.com']
 }));
-app.use(express.json());
+app.use(express.json({ limit: '5mb' })); // Increased limit for large bulk objects
 
 // --- CONFIGURATION ---
 const PORT = process.env.PORT || 3000;
@@ -25,7 +25,7 @@ const leadSchema = Joi.object({
     student_city: Joi.string().allow('', null),
     interested_city: Joi.string().allow('', null),
     interested_course: Joi.string().allow('', null),
-    medium: Joi.string().default('COLLEGEDUNIA') // Defaulting to the partner name
+    medium: Joi.string().default('COLLEGEDUNIA')
 });
 
 app.get('/status', (req, res) => {
@@ -37,7 +37,7 @@ app.get('/status', (req, res) => {
     });
 });
 
-// --- UPDATED BULK BRIDGE ROUTE ---
+// --- OPTIMIZED BRIDGE ROUTE (Solves 502 Timeout) ---
 app.post('/api/leads/collegedunia', async (req, res) => {
     // 1. Auth Check
     const incomingKey = req.headers['x-api-key'];
@@ -48,61 +48,66 @@ app.post('/api/leads/collegedunia', async (req, res) => {
 
     // 2. Normalize Input (Handle single object or array)
     const rawLeads = Array.isArray(req.body) ? req.body : [req.body];
-    const results = { success: 0, failed: 0, errors: [] };
 
-    // 3. Process Leads Loop
-    for (const leadData of rawLeads) {
-        const { error, value } = leadSchema.validate(leadData);
-        
-        if (error) {
-            results.failed++;
-            results.errors.push({ name: leadData.student_name || "Unknown", error: error.details[0].message });
-            continue; 
-        }
-
-        try {
-            // Robust Phone Cleaning
-            let cleanMobile = value.student_contact.toString().replace(/\D/g, '');
-            if (cleanMobile.length > 10) {
-                cleanMobile = cleanMobile.slice(-10);
-            }
-
-            if (cleanMobile.length !== 10) {
-                throw new Error("Mobile number must be exactly 10 digits.");
-            }
-
-            // 4. Final Payload Mapping to NeoDove
-            const neoDovePayload = {
-                name: value.student_name,
-                mobile: cleanMobile,
-                email: value.student_email || "no-email@foc.com",
-                detail1: value.interested_course || "General Inquiry", 
-                detail2: value.student_city || "Not Specified",     
-                detail3: value.interested_city || "Not Specified",  // New field mapping
-                source: "COLLEGEDUNIA",                    
-                medium: value.medium                       
-            };
-
-            // 5. Execute Push to NeoDove
-            await axios.post(NEODOVE_API, neoDovePayload, { timeout: 5000 });
-            results.success++;
-            console.log(`[SUCCESS] Lead synced: ${value.student_name}`);
-
-        } catch (err) {
-            results.failed++;
-            results.errors.push({ name: value.student_name, error: err.message });
-            console.error(`[SYNC FAILED] ${value.student_name}: ${err.message}`);
-        }
-    }
-
-    // 6. Summary Response
-    return res.status(200).json({ 
-        status: "complete", 
-        processed: rawLeads.length,
-        success_count: results.success,
-        failed_count: results.failed,
-        errors: results.errors 
+    // 3. IMMEDIATE RESPONSE
+    // We send a 202 Accepted status right away. This closes the connection with 
+    // the sender (Collegedunia) so the request doesn't hit Render's timeout limit.
+    res.status(202).json({ 
+        status: "accepted", 
+        message: `Received ${rawLeads.length} leads. Processing in background.`,
+        request_id: new Date().getTime()
     });
+
+    // 4. BACKGROUND PROCESSING
+    // This function continues running even after the response is sent.
+    const processInBackground = async () => {
+        console.log(`[BATCH START] Processing ${rawLeads.length} leads...`);
+        let success = 0;
+        let failed = 0;
+
+        for (const leadData of rawLeads) {
+            const { error, value } = leadSchema.validate(leadData);
+            
+            if (error) {
+                failed++;
+                continue; 
+            }
+
+            try {
+                // Robust Phone Cleaning
+                let cleanMobile = value.student_contact.toString().replace(/\D/g, '');
+                if (cleanMobile.length > 10) cleanMobile = cleanMobile.slice(-10);
+
+                if (cleanMobile.length !== 10) {
+                    failed++;
+                    continue;
+                }
+
+                const neoDovePayload = {
+                    name: value.student_name,
+                    mobile: cleanMobile,
+                    email: value.student_email || "no-email@foc.com",
+                    detail1: value.interested_course || "General Inquiry", 
+                    detail2: value.student_city || "Not Specified",     
+                    detail3: value.interested_city || "Not Specified",  
+                    source: "COLLEGEDUNIA",                    
+                    medium: value.medium                       
+                };
+
+                // Push to NeoDove with a shorter timeout per request
+                await axios.post(NEODOVE_API, neoDovePayload, { timeout: 3000 });
+                success++;
+
+            } catch (err) {
+                failed++;
+                console.error(`[SYNC FAILED] ${value.student_name}: ${err.message}`);
+            }
+        }
+        console.log(`[BATCH COMPLETE] Success: ${success}, Failed: ${failed}`);
+    };
+
+    // Trigger the background task
+    processInBackground();
 });
 
 app.listen(PORT, () => {
