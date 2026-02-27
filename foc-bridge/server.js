@@ -80,8 +80,9 @@ app.post('/api/leads/collegedunia', async (req, res) => {
     // 4. BACKGROUND PROCESSING FUNCTION
     const processLeads = async () => {
         console.log(`[BATCH START] Processing ${rawLeads.length} leads...`);
-        let processed = 0;
-
+        let success = 0;
+        const seenNumbers = new Set(); // Tracks numbers ALREADY processed in this batch
+    
         for (const leadData of rawLeads) {
             const { error, value } = leadSchema.validate(leadData);
             
@@ -89,18 +90,20 @@ app.post('/api/leads/collegedunia', async (req, res) => {
                 duplicateLog.push({ ...leadData, reason: `Validation: ${error.details[0].message}` });
                 continue; 
             }
-
+    
             try {
-                // Robust Phone Cleaning (Strips +91, 0, spaces, hyphens)
                 let cleanMobile = value.student_contact.toString().replace(/\D/g, '');
                 if (cleanMobile.length > 10) cleanMobile = cleanMobile.slice(-10);
-
-                if (cleanMobile.length !== 10) {
-                    duplicateLog.push({ ...leadData, reason: "Invalid mobile number length after cleaning" });
-                    continue;
+    
+                // --- NEW LOCAL DUPLICATE CHECK ---
+                if (seenNumbers.has(cleanMobile)) {
+                    console.warn(`[LOCAL DUPE] Skipping ${value.student_name} (${cleanMobile})`);
+                    duplicateLog.push({ ...leadData, reason: "Duplicate within the same batch" });
+                    continue; // Skip the API call to save time and capture for refund
                 }
-
-                // Final Payload Mapping
+                seenNumbers.add(cleanMobile);
+                // ---------------------------------
+    
                 const neoDovePayload = {
                     name: value.student_name,
                     mobile: cleanMobile,
@@ -111,24 +114,20 @@ app.post('/api/leads/collegedunia', async (req, res) => {
                     source: "COLLEGEDUNIA",                    
                     medium: value.medium                       
                 };
-
-                // Execute Push to NeoDove
+    
                 await axios.post(NEODOVE_API, neoDovePayload, { timeout: 4000 });
-                processed++;
-
+                success++;
+    
             } catch (err) {
-                // Catch duplicates specifically if CRM returns 409 or a duplicate message
                 const isDuplicate = err.response && (err.response.status === 409 || JSON.stringify(err.response.data).toLowerCase().includes("duplicate"));
-                
                 if (isDuplicate) {
                     duplicateLog.push({ ...leadData, reason: "Duplicate in CRM" });
                 } else {
-                    console.error(`[SYNC FAILED] ${value.student_name}: ${err.message}`);
                     duplicateLog.push({ ...leadData, reason: `System Error: ${err.message}` });
                 }
             }
         }
-        console.log(`[BATCH COMPLETE] Processed: ${processed}, Logged for refund: ${duplicateLog.length}`);
+        console.log(`[BATCH COMPLETE] Success: ${success}, Refund Log: ${duplicateLog.length}`);
     };
 
     // Trigger processing
