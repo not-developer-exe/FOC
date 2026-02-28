@@ -4,17 +4,24 @@ const axios = require('axios');
 const helmet = require('helmet');
 const cors = require('cors');
 const Joi = require('joi');
+const rateLimit = require('express-rate-limit'); // New dependency for security
 
 const app = express();
 app.use(helmet());
 app.use(cors({ origin: ['https://futureoncampus.com', 'https://www.futureoncampus.com'] }));
 app.use(express.json({ limit: '15mb' }));
 
+// Prevents brute-force or accidental DoS from partners
+const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000, 
+    max: 100, 
+    message: "Too many requests from this IP, please try again later."
+});
+app.use('/api/', limiter);
+
 const PORT = process.env.PORT || 3000;
 const COLLEGEDUNIA_KEY = process.env.COLLEGEDUNIA_SECRET_KEY;
 
-// --- CONFIGURATION: ZONE MAPPING ---
-// This moves your UUIDs out of .env and into a structured map
 const ZONE_MAP = {
     'central': {
         name: 'Central Zone',
@@ -26,12 +33,14 @@ const ZONE_MAP = {
     }
 };
 
+// In a real "Stark" lab, we'd use Redis or MongoDB here. 
+// For now, I've kept the array but added timestamps for better reporting.
 let refundLog = []; 
 
 const leadSchema = Joi.object({
-    student_name: Joi.string().min(2).required(),
-    student_email: Joi.string().email().allow('', null),
-    student_contact: Joi.alternatives().try(Joi.string(), Joi.number()).required(),
+    student_name: Joi.string().trim().min(2).required(),
+    student_email: Joi.string().email().lowercase().allow('', null),
+    student_contact: Joi.string().pattern(/^[0-9]+$/).min(10).required(),
     student_city: Joi.string().allow('', null),
     interested_city: Joi.string().allow('', null),
     interested_course: Joi.string().allow('', null),
@@ -40,43 +49,47 @@ const leadSchema = Joi.object({
 
 // --- API ENDPOINTS ---
 
-// Check server status
 app.get('/status', (req, res) => {
-    res.status(200).json({ status: "Online", bridge: "FOC Multi-Zone Bridge" });
+    res.status(200).json({ 
+        status: "Online", 
+        uptime: process.uptime(),
+        zones: Object.keys(ZONE_MAP) 
+    });
 });
 
-// Retrieve refund reports for the owner
 app.get('/api/leads/refunds', (req, res) => {
-    res.status(200).json({ total: refundLog.length, entries: refundLog });
+    res.status(200).json({ 
+        total: refundLog.length, 
+        last_updated: new Date().toISOString(),
+        entries: refundLog 
+    });
 });
 
-// Clear report after submission
 app.delete('/api/leads/refunds', (req, res) => {
     refundLog = [];
     res.status(200).json({ message: "Refund report cleared." });
 });
 
-// --- THE MULTI-ZONE BRIDGE ROUTE ---
-// Partners will now send to /api/leads/central or /api/leads/south
+// --- IMPROVED PROCESSING ROUTE ---
 app.post('/api/leads/:zone', async (req, res) => {
     const { zone } = req.params;
     const incomingKey = req.headers['x-api-key'];
 
-    if (incomingKey !== COLLEGEDUNIA_KEY) return res.status(401).json({ error: "Unauthorized." });
-    if (!ZONE_MAP[zone]) return res.status(404).json({ error: "Zone not found. Use 'central' or 'south'." });
+    if (incomingKey !== COLLEGEDUNIA_KEY) return res.status(401).json({ error: "Unauthorized access attempt." });
+    if (!ZONE_MAP[zone]) return res.status(404).json({ error: "Invalid Zone." });
 
     const rawLeads = Array.isArray(req.body) ? req.body : [req.body];
 
-    // Immediate response to prevent timeouts
+    // Send 202 Accepted immediately
     res.status(202).json({ 
         status: "accepted", 
         zone: ZONE_MAP[zone].name,
         count: rawLeads.length,
-        message: "Processing in background." 
+        received_at: new Date().toISOString()
     });
 
-    // Background processing
-    processZoneBatch(rawLeads, zone);
+    // Fire and forget background task
+    setImmediate(() => processZoneBatch(rawLeads, zone));
 });
 
 async function processZoneBatch(leads, zoneKey) {
@@ -84,22 +97,22 @@ async function processZoneBatch(leads, zoneKey) {
     const seenInBatch = new Set();
 
     for (const lead of leads) {
-        const { error, value } = leadSchema.validate(lead);
-        if (error) {
-            refundLog.push({ ...lead, zone: zoneKey, reason: `Validation: ${error.message}` });
-            continue;
-        }
-
-        let mobile = value.student_contact.toString().replace(/\D/g, '').slice(-10);
-
-        // Local Duplicate Check
-        if (seenInBatch.has(mobile)) {
-            refundLog.push({ ...lead, zone: zoneKey, reason: "Duplicate in file" });
-            continue;
-        }
-        seenInBatch.add(mobile);
-
         try {
+            const { error, value } = leadSchema.validate(lead);
+            
+            if (error) {
+                addToRefundLog(lead, zoneKey, `Validation: ${error.details[0].message}`);
+                continue;
+            }
+
+            const mobile = value.student_contact.toString().replace(/\D/g, '').slice(-10);
+
+            if (seenInBatch.has(mobile)) {
+                addToRefundLog(lead, zoneKey, "Duplicate in current batch");
+                continue;
+            }
+            seenInBatch.add(mobile);
+
             await axios.post(config.url, {
                 name: value.student_name,
                 mobile: mobile,
@@ -109,20 +122,29 @@ async function processZoneBatch(leads, zoneKey) {
                 interested_city: value.interested_city,
                 source: zoneKey.toUpperCase(),
                 medium: value.medium
-            }, { timeout: 5000 });
+            }, { timeout: 8000 }); // Increased timeout for slower CRM responses
 
-            // Throttling to prevent CRM API blocks
-            await new Promise(resolve => setTimeout(resolve, 150));
+            // Slightly dynamic throttling
+            await new Promise(r => setTimeout(r, 200));
 
         } catch (err) {
-            const isDupe = err.response && (err.response.status === 409 || JSON.stringify(err.response.data).toLowerCase().includes("duplicate"));
-            refundLog.push({ 
-                ...lead, 
-                zone: zoneKey, 
-                reason: isDupe ? "Duplicate in CRM" : `Error: ${err.message}` 
-            });
+            const errorMsg = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+            const isDupe = errorMsg.toLowerCase().includes("duplicate") || err.response?.status === 409;
+            
+            addToRefundLog(lead, zoneKey, isDupe ? "Duplicate in CRM" : `External Error: ${errorMsg}`);
         }
     }
 }
 
-app.listen(PORT, () => console.log(`FOC Multi-Zone Bridge Live on Port ${PORT}`));
+function addToRefundLog(lead, zone, reason) {
+    refundLog.push({
+        timestamp: new Date().toISOString(),
+        zone,
+        reason,
+        data: lead
+    });
+    // Optional: Keep log size manageable in memory
+    if (refundLog.length > 1000) refundLog.shift(); 
+}
+
+app.listen(PORT, () => console.log(`🚀 Bridge active on port ${PORT}`));
