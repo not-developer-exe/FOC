@@ -7,20 +7,27 @@ const Joi = require('joi');
 
 const app = express();
 app.use(helmet());
-app.use(cors({
-    origin: ['https://futureoncampus.com', 'https://www.futureoncampus.com']
-}));
-app.use(express.json({ limit: '10mb' })); // Increased limit for heavy bulk batches
+app.use(cors({ origin: ['https://futureoncampus.com', 'https://www.futureoncampus.com'] }));
+app.use(express.json({ limit: '15mb' }));
 
-// --- CONFIGURATION ---
 const PORT = process.env.PORT || 3000;
-const NEODOVE_API = process.env.NEODOVE_API_URL;
-const COLLEGEDUNIA_KEY = process.env.COLLEGEDUNIA_SECRET_KEY || "FOC_SECURE_2026";
+const COLLEGEDUNIA_KEY = process.env.COLLEGEDUNIA_SECRET_KEY;
 
-// In-memory store for duplicates (Note: Resets on server restart)
-let duplicateLog = [];
+// --- CONFIGURATION: ZONE MAPPING ---
+// This moves your UUIDs out of .env and into a structured map
+const ZONE_MAP = {
+    'central': {
+        name: 'Central Zone',
+        url: 'https://15dcccc1-084b-492a-8444-28992cd90433.neodove.com/integration/custom/e37b53e9-d4a4-45ad-9229-cf808235f1fa/leads'
+    },
+    'south': {
+        name: 'South Zone',
+        url: 'https://15dcccc1-084b-492a-8444-28992cd90433.neodove.com/integration/custom/31814184-5242-467a-817f-c1770d451110/leads'
+    }
+};
 
-// --- UPDATED VALIDATION SCHEMA ---
+let refundLog = []; 
+
 const leadSchema = Joi.object({
     student_name: Joi.string().min(2).required(),
     student_email: Joi.string().email().allow('', null),
@@ -31,109 +38,91 @@ const leadSchema = Joi.object({
     medium: Joi.string().default('COLLEGEDUNIA')
 });
 
-// --- UTILITY ENDPOINTS ---
+// --- API ENDPOINTS ---
 
 // Check server status
 app.get('/status', (req, res) => {
-    res.status(200).json({
-        status: "Online",
-        timestamp: new Date().toISOString(),
-        bridge: "Future On Campus - Collegedunia Integration",
-        config_status: process.env.NEODOVE_API_URL ? "Ready" : "Missing Config"
-    });
+    res.status(200).json({ status: "Online", bridge: "FOC Multi-Zone Bridge" });
 });
 
-// Retrieve duplicate/failed leads for refund claims
-app.get('/api/leads/duplicates', (req, res) => {
-    res.status(200).json({
-        total_duplicates: duplicateLog.length,
-        entries: duplicateLog
-    });
+// Retrieve refund reports for the owner
+app.get('/api/leads/refunds', (req, res) => {
+    res.status(200).json({ total: refundLog.length, entries: refundLog });
 });
 
-// Clear the duplicate log
-app.delete('/api/leads/duplicates', (req, res) => {
-    duplicateLog = [];
-    res.status(200).json({ message: "Duplicate log cleared." });
+// Clear report after submission
+app.delete('/api/leads/refunds', (req, res) => {
+    refundLog = [];
+    res.status(200).json({ message: "Refund report cleared." });
 });
 
-// --- THE MAIN BRIDGE ROUTE ---
-
-app.post('/api/leads/collegedunia', async (req, res) => {
-    // 1. Auth Check
+// --- THE MULTI-ZONE BRIDGE ROUTE ---
+// Partners will now send to /api/leads/central or /api/leads/south
+app.post('/api/leads/:zone', async (req, res) => {
+    const { zone } = req.params;
     const incomingKey = req.headers['x-api-key'];
-    if (incomingKey !== COLLEGEDUNIA_KEY) {
-        console.error(`[AUTH ERROR] Unauthorized attempt from IP: ${req.ip}`);
-        return res.status(401).json({ status: "error", message: "Unauthorized." });
-    }
 
-    // 2. Normalize Input (Handle single object or array)
+    if (incomingKey !== COLLEGEDUNIA_KEY) return res.status(401).json({ error: "Unauthorized." });
+    if (!ZONE_MAP[zone]) return res.status(404).json({ error: "Zone not found. Use 'central' or 'south'." });
+
     const rawLeads = Array.isArray(req.body) ? req.body : [req.body];
 
-    // 3. IMMEDIATE RESPONSE (Prevents 502 Timeout)
+    // Immediate response to prevent timeouts
     res.status(202).json({ 
         status: "accepted", 
-        message: `Received ${rawLeads.length} leads. Processing in background.`,
-        duplicate_check_url: "/api/leads/duplicates"
+        zone: ZONE_MAP[zone].name,
+        count: rawLeads.length,
+        message: "Processing in background." 
     });
 
-    // 4. BACKGROUND PROCESSING FUNCTION
-    const processLeads = async () => {
-        console.log(`[BATCH START] Processing ${rawLeads.length} leads...`);
-        let success = 0;
-        const seenNumbers = new Set(); // Tracks numbers ALREADY processed in this batch
-    
-        for (const leadData of rawLeads) {
-            const { error, value } = leadSchema.validate(leadData);
-            
-            if (error) {
-                duplicateLog.push({ ...leadData, reason: `Validation: ${error.details[0].message}` });
-                continue; 
-            }
-    
-            try {
-                let cleanMobile = value.student_contact.toString().replace(/\D/g, '');
-                if (cleanMobile.length > 10) cleanMobile = cleanMobile.slice(-10);
-    
-                // --- NEW LOCAL DUPLICATE CHECK ---
-                if (seenNumbers.has(cleanMobile)) {
-                    console.warn(`[LOCAL DUPE] Skipping ${value.student_name} (${cleanMobile})`);
-                    duplicateLog.push({ ...leadData, reason: "Duplicate within the same batch" });
-                    continue; // Skip the API call to save time and capture for refund
-                }
-                seenNumbers.add(cleanMobile);
-                // ---------------------------------
-    
-                const neoDovePayload = {
-                    name: value.student_name,
-                    mobile: cleanMobile,
-                    student_email: value.student_email || "no-email@foc.com",
-                    interested_course: value.interested_course || "General Inquiry", 
-                    student_city: value.student_city || "Not Specified",     
-                    interested_city: value.interested_city || "Not Specified",  
-                    source: "COLLEGEDUNIA",                    
-                    medium: value.medium                       
-                };
-    
-                await axios.post(NEODOVE_API, neoDovePayload, { timeout: 4000 });
-                success++;
-    
-            } catch (err) {
-                const isDuplicate = err.response && (err.response.status === 409 || JSON.stringify(err.response.data).toLowerCase().includes("duplicate"));
-                if (isDuplicate) {
-                    duplicateLog.push({ ...leadData, reason: "Duplicate in CRM" });
-                } else {
-                    duplicateLog.push({ ...leadData, reason: `System Error: ${err.message}` });
-                }
-            }
+    // Background processing
+    processZoneBatch(rawLeads, zone);
+});
+
+async function processZoneBatch(leads, zoneKey) {
+    const config = ZONE_MAP[zoneKey];
+    const seenInBatch = new Set();
+
+    for (const lead of leads) {
+        const { error, value } = leadSchema.validate(lead);
+        if (error) {
+            refundLog.push({ ...lead, zone: zoneKey, reason: `Validation: ${error.message}` });
+            continue;
         }
-        console.log(`[BATCH COMPLETE] Success: ${success}, Refund Log: ${duplicateLog.length}`);
-    };
 
-    // Trigger processing
-    processLeads();
-});
+        let mobile = value.student_contact.toString().replace(/\D/g, '').slice(-10);
 
-app.listen(PORT, () => {
-    console.log(`Future On Campus Bridge is Live on Port ${PORT}`);
-});
+        // Local Duplicate Check
+        if (seenInBatch.has(mobile)) {
+            refundLog.push({ ...lead, zone: zoneKey, reason: "Duplicate in file" });
+            continue;
+        }
+        seenInBatch.add(mobile);
+
+        try {
+            await axios.post(config.url, {
+                name: value.student_name,
+                mobile: mobile,
+                email: value.student_email || "no-email@foc.com",
+                interested_course: value.interested_course,
+                student_city: value.student_city,
+                interested_city: value.interested_city,
+                source: zoneKey.toUpperCase(),
+                medium: value.medium
+            }, { timeout: 5000 });
+
+            // Throttling to prevent CRM API blocks
+            await new Promise(resolve => setTimeout(resolve, 150));
+
+        } catch (err) {
+            const isDupe = err.response && (err.response.status === 409 || JSON.stringify(err.response.data).toLowerCase().includes("duplicate"));
+            refundLog.push({ 
+                ...lead, 
+                zone: zoneKey, 
+                reason: isDupe ? "Duplicate in CRM" : `Error: ${err.message}` 
+            });
+        }
+    }
+}
+
+app.listen(PORT, () => console.log(`FOC Multi-Zone Bridge Live on Port ${PORT}`));
